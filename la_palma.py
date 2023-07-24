@@ -8,7 +8,6 @@ from rasterio.transform import from_bounds
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
 import pickle
-import folium
 
 from pathlib import Path
 from shapely.geometry import Point, Polygon, MultiPolygon, shape
@@ -103,7 +102,28 @@ def random_forest_classifier(lidar_gdf, model_output_path):
     lidar_classified_gdf['predicted_classification'] = rf_classifier.predict(X)
 
     return lidar_classified_gdf
-    
+
+def random_forest_classifier_from_pickle(lidar_gdf, model_output_path):
+    """
+    Loads a trained Random Forest Classifier from a pickle file and uses it to predict classifications for a Lidar GeoDataFrame.
+
+    Args:
+        lidar_gdf (GeoDataFrame): A GeoDataFrame containing Lidar data.
+        model_output_path (str): The file path to the trained Random Forest Classifier pickle file.
+
+    Returns:
+        None
+    """
+    X = lidar_gdf.drop(['classification', 'geometry'], axis=1)
+    print(f"Loading Random Forest Model from Pickle File: {model_output_path}")
+    with open(OUT_RF_MODEL, 'rb') as file:
+        rf_classifier = pickle.load(file)
+    print("Predicting Classifications...")
+    lidar_classified_gdf = lidar_gdf.copy()
+    lidar_classified_gdf['predicted_classification'] = rf_classifier.predict(X)
+    print("Prediction completed.")
+    return lidar_classified_gdf
+
 def buildings_to_polygon(lidar_classified_gdf, resolution, desired_crs, output_raster, output_shape_buildings, output_shape_buildings_points):
     """
     Converts classified building points from a lidar GeoDataFrame into polygons and saves them as an ESRI Shapefile.
@@ -122,10 +142,10 @@ def buildings_to_polygon(lidar_classified_gdf, resolution, desired_crs, output_r
                                                with columns for polygons, centroids and area.
     """
     building_points_gdf = lidar_classified_gdf[lidar_classified_gdf['predicted_classification'] == 6]
+
     bounds = building_points_gdf.total_bounds
     rows = int((bounds[3] - bounds[1]) / resolution)
     cols = int((bounds[2] - bounds[0]) / resolution)
-
     output_profile = {
         'driver': 'GTiff',
         'dtype': np.uint8,
@@ -133,30 +153,25 @@ def buildings_to_polygon(lidar_classified_gdf, resolution, desired_crs, output_r
         'width': cols,
         'height': rows,
         'transform': from_bounds(*bounds, cols, rows),
-        'crs': DESIRED_CRS,
+        'crs': desired_crs,
     }
-
-    raster = np.zeros((output_profile['height'], output_profile['width']), dtype=np.uint8)
-
+    raster = np.zeros((output_profile['height'], output_profile['width']), output_profile['dtype'])
     rasterized = rasterize(
         shapes=building_points_gdf.geometry,
         out=raster,
         transform=output_profile['transform'],
         fill=0,
         default_value=255,
-        dtype=np.uint8,
+        dtype=output_profile['dtype'],
     )
 
     with rasterio.open(output_raster, 'w', **output_profile) as dst:
         dst.write(rasterized, 1)
-
-    with rasterio.open(output_raster) as src:
-        raster = src.read(1)
-        transform = src.transform
     print(f"Building Raster saved: {output_raster}")
 
+
     polygons = []
-    for polygon, value in shapes(raster, mask=raster == 255, transform=transform):
+    for polygon, value in shapes(raster, mask=raster == 255, transform=output_profile['transform']):
         if value == 255:
             polygons.append(shape(polygon))
 
@@ -278,7 +293,7 @@ def lava_extractor(lava_classified_gdf, out_shapefile_lavaflow):
         lava_polygon_gdf (GeoDataFrame): GeoDataFrame containing the extracted lava flow polygon.
     """
     cluster_number = int(input('Enter the K-Means cluster number representing the lava flow:'))
-    lava_gdf = lava_classified_gdf[lava_classified_gdf['cluster_kmeans'] == cluster_number].copy()
+    lava_gdf = lava_classified_gdf[lava_classified_gdf['cluster_kmeans'] == cluster_number]
     lava_gdf['x'] = lava_gdf['geometry'].x
     lava_gdf['y'] = lava_gdf['geometry'].y
     
@@ -451,15 +466,15 @@ def main():
         None
     """
     lidar_gdf = import_las_to_geoDataFrame(IN_AOI_LAS, DESIRED_CRS)
-    lidar_classified_gdf = random_forest_classifier(lidar_gdf, OUT_RF_MODEL)
+    lidar_classified_gdf = random_forest_classifier_from_pickle(lidar_gdf, OUT_RF_MODEL)
     buildings_filtered_gdf = buildings_to_polygon(lidar_classified_gdf, RESOLUTION, DESIRED_CRS, OUT_RASTER_BUILDINGS, OUT_SHAPEFILE_BUILDINGS_POLYGON, OUT_SHAPEFILE_BUILDINGS_POINT)
     lava_classified_gdf = lava_cluster_plotter(IN_IMAGE, OUT_RASTER_LAVA_CLASSIFICATION) 
     lava_polygon_gdf = lava_extractor(lava_classified_gdf, OUT_SHAPEFILE_LAVAFLOW)
     buildings_w_lava_gdf = affected_buildings(buildings_filtered_gdf, lava_classified_gdf, OUT_SHAPEFILE_AFFECTED_BUILDINGS, OUT_SHAPEFILE_AFFECTED_BUILDINGS_POINTS)
     elevation_change(IN_RASTER_BEFORE, IN_RASTER_AFTER, OUT_RASTER_DIFFERENCE)
-    import_geoDataFrame_to_database(buildings_filtered_gdf, 'buildings')
-    import_geoDataFrame_to_database(lava_polygon_gdf, 'lava_flow')
-    import_geoDataFrame_to_database(buildings_w_lava_gdf, 'affected_buildings')
+    # import_geoDataFrame_to_database(buildings_filtered_gdf, 'buildings')
+    # import_geoDataFrame_to_database(lava_polygon_gdf, 'lava_flow')
+    # import_geoDataFrame_to_database(buildings_w_lava_gdf, 'affected_buildings')
     # import_raster_to_database(OUT_RASTER_DIFFERENCE, 'elevation_raster')
 
 if __name__ == '__main__':
