@@ -360,8 +360,6 @@ def elevation_change(in_raster_before, in_raster_after, out_raster_difference):
     """
     src1 = rasterio.open(in_raster_before)
     src2 = rasterio.open(in_raster_after)
-
-    # Reproject the second raster to match the resolution and extent of the first raster
     data2, _ = rasterio.warp.reproject(
         source=rasterio.band(src2, 1),
         destination=np.empty_like(src1.read(1)),
@@ -371,26 +369,15 @@ def elevation_change(in_raster_before, in_raster_after, out_raster_difference):
         dst_crs=src1.crs,
         resampling=Resampling.bilinear)
 
-    # Read the input raster data
     data1 = src1.read(1)
-
-    # Compute the difference between the rasters
     diff = data1 - data2
-
-    # Replace inf and NaN values with a valid nodata value
     diff[np.isinf(diff) | np.isnan(diff)] = src1.nodata
-
-    # Prepare the output GeoTIFF file
     output_profile = src1.profile
-    output_profile.update(count=1)  # Update band count
-
-    # Create the output file
+    output_profile.update(count=1) 
     with rasterio.open(out_raster_difference, 'w', **output_profile) as dst:
-        # Write the difference data to the output file
         dst.write(diff, 1)
     print(f'Elevation Change GeoTIFF saved: {out_raster_difference}')
 
-    # Close the input files
     src1.close()
     src2.close()
 
@@ -428,7 +415,6 @@ def import_raster_to_database(input_raster, table_name):
     username = 'postgres'
     password = getpass.getpass('Enter the database password:')
 
-    # Define the command to run, including any necessary arguments
     command_raster2pgsql = [
         r"C:\Program Files\PostgreSQL\15\bin\raster2pgsql.exe", '-I', '-C', '-M', input_raster
     ]
@@ -437,17 +423,13 @@ def import_raster_to_database(input_raster, table_name):
         '--password', password
     ]
 
-    # Run the raster2pgsql command and capture the output
     process_raster2pgsql = subprocess.Popen(command_raster2pgsql, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output_raster2pgsql, error_raster2pgsql = process_raster2pgsql.communicate()
 
-    # Check the return code of raster2pgsql command
     if process_raster2pgsql.returncode == 0:
-        # Run the psql command and capture the output
         process_psql = subprocess.Popen(command_psql, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         output_psql, error_psql = process_psql.communicate(input=output_raster2pgsql)
         
-        # Check the return code of psql command
         if process_psql.returncode == 0:
             print(f'Raster file {input_raster} saved to the PostGIS database table {table_name}')
         else:
