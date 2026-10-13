@@ -36,7 +36,7 @@ Lava flow polygon extracted from a Sentinel image with K-Means and DBSCAN, cover
 
 ### Affected buildings
 ![Affected buildings](images/affected_buildings.png)
-Buildings detected from lidar with a Random Forest classifier (~86% accuracy on the test set) that intersect the lava flow: **200 buildings**.
+Buildings detected from lidar with a Random Forest classifier (~86% accuracy on the test set) that intersect the lava flow: **3126 buildings**.
 
 ### Morphology change
 ![Elevation change](images/DTM_diff.png)
