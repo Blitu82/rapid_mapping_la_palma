@@ -1,6 +1,6 @@
 # Rapid Mapping of the 2021 La Palma Volcanic Eruption
 
-Automated geospatial pipeline in Python that estimates the **extent of the lava flow**, the **buildings affected** and the **change in the island's morphology** after the 2021 Cumbre Vieja eruption (La Palma, Canary Islands), and stores the results in a **PostgreSQL / PostGIS** database.
+Automated geospatial pipeline in Python that estimates the **extent of the lava flow**, the **buildings affected** and the **change in the island's morphology** after the 2021 Cumbre Vieja eruption, and stores the results in a **PostgreSQL / PostGIS** database.
 
 Final project of the Ironhack Data Analytics bootcamp.
 
