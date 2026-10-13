@@ -28,6 +28,10 @@ This project is inspired by that work and aims to automate the production of sim
 
 Coordinate reference system: ETRS89 / UTM zone 28N (EPSG:32628).
 
+![Lava flow extent](images/lava_flow_extent.png)
+![Affected buildings](images/affected_buildings.png)
+![Elevation change](images/DTM_diff.png)
+
 ## Data
 
 The data are not included in this repository because of their size. They can be downloaded from:
