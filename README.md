@@ -28,9 +28,19 @@ This project is inspired by that work and aims to automate the production of sim
 
 Coordinate reference system: ETRS89 / UTM zone 28N (EPSG:32628).
 
+## Results
+
+### Lava flow extent
 ![Lava flow extent](images/lava_flow_extent.png)
+Lava flow polygon extracted from a Sentinel image with K-Means and DBSCAN, covering **12.4 km²**.
+
+### Affected buildings
 ![Affected buildings](images/affected_buildings.png)
+Buildings detected from lidar with a Random Forest classifier (~86% accuracy on the test set) that intersect the lava flow: **200 buildings**.
+
+### Morphology change
 ![Elevation change](images/DTM_diff.png)
+Elevation difference between the pre-eruption terrain model and the post-eruption surface model (January 2022).
 
 ## Data
 
