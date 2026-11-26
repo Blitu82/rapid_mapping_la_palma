@@ -1,0 +1,26 @@
+# Recommended on Windows: geopandas/rasterio install far more easily from conda-forge.
+#   conda env create -f environment.yml
+#   conda activate la-palma
+name: la-palma
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - geopandas
+  - shapely>=2
+  - rasterio
+  - laspy
+  - scikit-learn
+  - matplotlib
+  - sqlalchemy>=2
+  - geoalchemy2
+  - psycopg2
+  - python-dotenv
+  - jupyter
+  - folium
+  - pytest
+  - pip
+  - pip:
+      - alphashape

@@ -1,0 +1,17 @@
+# Local PostGIS database for the results.
+#   docker compose up -d
+# Reads DB_* values from your .env file.
+services:
+  db:
+    image: postgis/postgis:15-3.4
+    container_name: la_palma_db
+    environment:
+      POSTGRES_DB: ${DB_NAME:-la_palma}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - la_palma_pgdata:/var/lib/postgresql/data
+volumes:
+  la_palma_pgdata:

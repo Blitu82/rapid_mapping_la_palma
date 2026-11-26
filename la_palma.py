@@ -1,463 +1,431 @@
+"""
+Rapid mapping of the 2021 La Palma (Cumbre Vieja) eruption.
+
+Pipeline:
+  1. Load an airborne lidar point cloud (LAS) and classify building points (Random Forest).
+  2. Convert building points to building polygons / centroids (rasterise + vectorise).
+  3. Cluster a Sentinel image (K-Means), pick the lava cluster, and extract the lava flow
+     polygon (DBSCAN + alpha shape).
+  4. Intersect buildings with the lava flow to find affected buildings.
+  5. Compute elevation change between a pre- and a post-eruption DTM/DSM.
+  6. Optionally load the results into a PostGIS database.
+
+All paths are relative to --data-dir / --output-dir (see `build_paths`); nothing is
+hard-coded to a particular machine. Database credentials come from environment
+variables (or a .env file) and the password is asked for interactively if missing.
+
+Usage:
+    python la_palma.py --data-dir data --output-dir output
+    python la_palma.py --lava-cluster 3 --no-plots --to-db
+"""
+import argparse
+import getpass
+import math
+import os
+import pickle
+import shutil
+import subprocess
+from pathlib import Path
+
+import geopandas as gpd
 import laspy
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import geopandas as gpd
 import rasterio
-from rasterio.features import rasterize, shapes
-from rasterio.transform import from_bounds
+import rasterio.warp
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
-import pickle
-
-from pathlib import Path
-from shapely.geometry import Point, Polygon, MultiPolygon, shape
-import matplotlib.pyplot as plt
-from matplotlib.ticker import ScalarFormatter
+from rasterio.features import rasterize, shapes
+from rasterio.transform import from_origin
+from rasterio.transform import xy as transform_xy
+from shapely.geometry import MultiPoint, shape
 from sklearn.cluster import DBSCAN, KMeans
-from sklearn.preprocessing import StandardScaler
-from alphashape import alphashape
-from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score
-from sqlalchemy import create_engine
-import geoalchemy2
-import getpass
-import subprocess
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
-# INPUTS
-IN_SAMPLE_LAS = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\input\las\extracted_lidar.las")
-IN_AOI_LAS = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\input\las\lidar_AOI.las")
-IN_IMAGE = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\Fotos aereas\sentinel_lava.tif")
-IN_RASTER_BEFORE = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\input\DTM\before\Before_MDT02_REGCAN95_UTM28N_2m.tiff")
-IN_RASTER_AFTER = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\input\DTM\after\Cumbre_Vieja_DSM_SfM_January_2022_20cm_REGCAN95.tif")
-DESIRED_CRS = CRS.from_epsg(32628)
-RESOLUTION = 1.75
+DESIRED_CRS = CRS.from_epsg(32628)  # WGS 84 / UTM 28N
+RESOLUTION = 1.75                   # raster cell size (m) used to vectorise buildings
+MIN_BUILDING_AREA = 10.0            # m2, smaller polygons are discarded
+BUILDING_CLASS = 6                  # ASPRS lidar class "Building"
 
-# OUTPUTS
-OUT_RASTER_BUILDINGS = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\output\output_raster\buildings.tif")
-OUT_RASTER_LAVA_CLASSIFICATION = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\output\output_raster\classified_lava.tif")
-OUT_SHAPEFILE_BUILDINGS_POLYGON = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\output\output_shape\buildings_rasterize\buildings_polygon.shp")
-OUT_SHAPEFILE_BUILDINGS_POINT = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\output\output_shape\buildings_rasterize\buildings_points.shp")
-OUT_SHAPEFILE_BUILDINGS_DBSCAN = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\output\output_shape\buildings_dbscan\buildings_dbscan.shp")
-OUT_SHAPEFILE_LAVAFLOW = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\output\output_shape\lava_flow\lava_flow.shp")
-OUT_SHAPEFILE_AFFECTED_BUILDINGS = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\output\output_shape\affected_buildings\affected_buildings_area.shp")
-OUT_SHAPEFILE_AFFECTED_BUILDINGS_POINTS = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\output\output_shape\affected_buildings\affected_buildings_point.shp")
-OUT_RF_MODEL = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\output\random_forest_classifier\RF_model.pickle")
-OUT_RASTER_DIFFERENCE = Path(r"C:\Users\garpa\OneDrive\Documents\GitHub\final_project\La_Palma\output\DTM_difference\difference.tif")
 
-# DEFINE FUNCTIONS:
+# --------------------------------------------------------------------------- paths
+def build_paths(data_dir, output_dir):
+    """Return a dict with every input and output path used by the pipeline."""
+    d, o = Path(data_dir), Path(output_dir)
+    return {
+        # inputs
+        "aoi_las": d / "las" / "lidar_AOI.las",
+        "image": d / "sentinel" / "sentinel_lava.tif",
+        "dtm_before": d / "dtm" / "before" / "Before_MDT02_REGCAN95_UTM28N_2m.tiff",
+        "dtm_after": d / "dtm" / "after" / "Cumbre_Vieja_DSM_SfM_January_2022_20cm_REGCAN95.tif",
+        # outputs
+        "rf_model": o / "random_forest_classifier" / "RF_model.pickle",
+        "buildings_raster": o / "output_raster" / "buildings.tif",
+        "lava_raster": o / "output_raster" / "classified_lava.tif",
+        "buildings_polygon": o / "output_shape" / "buildings_rasterize" / "buildings_polygon.shp",
+        "buildings_point": o / "output_shape" / "buildings_rasterize" / "buildings_points.shp",
+        "buildings_dbscan": o / "output_shape" / "buildings_dbscan" / "buildings_dbscan.shp",
+        "lava_flow": o / "output_shape" / "lava_flow" / "lava_flow.shp",
+        "affected_polygon": o / "output_shape" / "affected_buildings" / "affected_buildings_area.shp",
+        "affected_point": o / "output_shape" / "affected_buildings" / "affected_buildings_point.shp",
+        "difference": o / "DTM_difference" / "difference.tif",
+    }
 
+
+def _ensure_parent(path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+
+def _finish_plot(show):
+    if show:
+        plt.show()
+    else:
+        plt.close()
+
+
+# ------------------------------------------------------------------- lidar -> buildings
 def import_las_to_geoDataFrame(in_file, desired_crs):
     """
-    Imports a LAS file and converts it into a Pandas GeoDataFrame.
-
-    Parameters:
-        in_file (str): The path to the LAS file to be imported.
-
-    Returns:
-        lidar_gdf (GeoDataFrame): A GeoDataFrame containing the LAS data
-                                  with x, y, z, classification and geometry columns.
+    Read a LAS file into a GeoDataFrame with columns x, y, z, classification, geometry.
     """
     print("Loading LAS file...")
-    las_data = laspy.read(in_file)
-    x = np.array(las_data.x)
-    y = np.array(las_data.y)
-    z = np.array(las_data.z)
-    c = np.array(las_data.classification)
+    las = laspy.read(in_file)
+    x, y, z = np.array(las.x), np.array(las.y), np.array(las.z)
+    df = pd.DataFrame({"x": x, "y": y, "z": z, "classification": np.array(las.classification)})
+    gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(x, y), crs=desired_crs)
+    print(f"LAS file loaded: {len(gdf):,} points.")
+    return gdf
 
-    df = pd.DataFrame({'x': x, 'y': y, 'z': z, 'classification': c})
-    df['geometry'] = df.apply(lambda row: Point(row['x'], row['y']), axis=1)
-    lidar_gdf = gpd.GeoDataFrame(df, crs=desired_crs, geometry=df['geometry'])
-    print("LAS file loaded to a Pandas GeoDataFrame.")
-    return lidar_gdf
 
-def random_forest_classifier(lidar_gdf, model_output_path):
+def random_forest_classifier(lidar_gdf, model_output_path, random_state=100, n_jobs=-1):
     """
-    Trains a Random Forest Classifier using lidar data and saves the model to a pickle file.
+    Train a Random Forest on x, y, z to predict the lidar classification, save it as a
+    pickle file and return a copy of the input with a 'predicted_classification' column.
 
-    Parameters:
-        lidar_gdf (GeoDataFrame): A GeoDataFrame containing lidar data with columns for x, y, z,
-                                  classification and geometry.
-        model_output_path (str): The path to save the trained Random Forest model as a pickle file.
-
-    Returns:
-        lidar_classified_gdf (GeoDataFrame): A copy of the input GeoDataFrame with an additional
-                                             column ('predicted_classification') that contains the
-                                             predicted classifications from the Random Forest model.
+    NOTE: the features are the point coordinates only and the hold-out set is a random
+    20 % of the same point cloud, so the reported accuracy is optimistic for unseen areas.
     """
-    X = lidar_gdf.drop(['classification', 'geometry'], axis=1)
-    y = lidar_gdf['classification']
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=100)
-    rf_classifier = RandomForestClassifier()
-    print("Fitting Random Forest Classifier Model...")
-    rf_classifier.fit(X_train, y_train)
-    y_pred = rf_classifier.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
-    print(f"Random Forest accuracy: {accuracy}")
-    with open(model_output_path, 'wb') as file:
-        pickle.dump(rf_classifier, file)
-    print(f"Random Forest Model Pickle File saved: {model_output_path}")
+    X = lidar_gdf[["x", "y", "z"]]
+    y = lidar_gdf["classification"]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=random_state)
+    rf = RandomForestClassifier(random_state=random_state, n_jobs=n_jobs)
+    print("Fitting Random Forest classifier...")
+    rf.fit(X_train, y_train)
+    y_pred = rf.predict(X_test)
+    print(f"Random Forest accuracy (random hold-out): {accuracy_score(y_test, y_pred):.4f}")
+    print(classification_report(y_test, y_pred, zero_division=0))
 
-    lidar_classified_gdf = lidar_gdf.copy()
-    lidar_classified_gdf['predicted_classification'] = rf_classifier.predict(X)
+    _ensure_parent(model_output_path)
+    with open(model_output_path, "wb") as fh:
+        pickle.dump(rf, fh)
+    print(f"Random Forest model saved: {model_output_path}")
 
-    return lidar_classified_gdf
+    out = lidar_gdf.copy()
+    out["predicted_classification"] = rf.predict(X)
+    return out
 
-def random_forest_classifier_from_pickle(lidar_gdf, model_output_path):
+
+def buildings_to_polygon(lidar_classified_gdf, resolution, desired_crs, output_raster,
+                         output_shape_buildings, output_shape_buildings_points,
+                         min_area=MIN_BUILDING_AREA):
     """
-    Loads a trained Random Forest Classifier from a pickle file and uses it to predict classifications for a Lidar GeoDataFrame.
+    Rasterise predicted building points, vectorise the raster into polygons, drop polygons
+    smaller than `min_area` m2 and save polygons and centroids as shapefiles.
 
-    Args:
-        lidar_gdf (GeoDataFrame): A GeoDataFrame containing Lidar data.
-        model_output_path (str): The file path to the trained Random Forest Classifier pickle file.
-
-    Returns:
-        None
+    Returns a GeoDataFrame whose active geometry column is 'polygons' and which also has a
+    'centroids' geometry column and an 'area' column (m2).
     """
-    X = lidar_gdf.drop(['classification', 'geometry'], axis=1)
-    print(f"Loading Random Forest Model from Pickle File: {model_output_path}")
-    with open(OUT_RF_MODEL, 'rb') as file:
-        rf_classifier = pickle.load(file)
-    print("Predicting Classifications...")
-    lidar_classified_gdf = lidar_gdf.copy()
-    lidar_classified_gdf['predicted_classification'] = rf_classifier.predict(X)
-    print("Prediction completed.")
-    return lidar_classified_gdf
+    pts = lidar_classified_gdf[lidar_classified_gdf["predicted_classification"] == BUILDING_CLASS]
+    if pts.empty:
+        raise ValueError("No points predicted as buildings (class 6).")
+    minx, miny, maxx, maxy = pts.total_bounds
+    cols = max(1, math.ceil((maxx - minx) / resolution))
+    rows = max(1, math.ceil((maxy - miny) / resolution))
+    transform = from_origin(minx, maxy, resolution, resolution)
 
-def buildings_to_polygon(lidar_classified_gdf, resolution, desired_crs, output_raster, output_shape_buildings, output_shape_buildings_points):
+    raster = rasterize(shapes=pts.geometry, out_shape=(rows, cols), transform=transform,
+                       fill=0, default_value=255, dtype=np.uint8)
+
+    _ensure_parent(output_raster)
+    profile = {"driver": "GTiff", "dtype": "uint8", "count": 1, "width": cols, "height": rows,
+               "transform": transform, "crs": desired_crs}
+    with rasterio.open(output_raster, "w", **profile) as dst:
+        dst.write(raster, 1)
+    print(f"Building raster saved: {output_raster}")
+
+    polygons = [shape(geom) for geom, value in shapes(raster, mask=raster == 255, transform=transform)
+                if value == 255]
+    gdf = gpd.GeoDataFrame({"geometry": polygons}, crs=desired_crs).rename_geometry("polygons")
+    gdf["centroids"] = gdf.centroid
+    gdf["area"] = gdf.area
+    filtered = gdf[gdf["area"] > min_area].copy()
+
+    _ensure_parent(output_shape_buildings)
+    filtered["polygons"].to_file(output_shape_buildings, driver="ESRI Shapefile")
+    filtered["centroids"].to_file(output_shape_buildings_points, driver="ESRI Shapefile")
+    print(f"{len(filtered)} buildings saved: {output_shape_buildings}")
+    return filtered
+
+
+def buildings_to_polygon_dbscan(lidar_classified_gdf, desired_crs, out_shapefile_buildings_dbscan,
+                                eps=0.1, min_samples=5):
     """
-    Converts classified building points from a lidar GeoDataFrame into polygons and saves them as an ESRI Shapefile.
-
-    Parameters:
-        lidar_classified_gdf (GeoDataFrame): A GeoDataFrame containing classified lidar data with columns
-                                             for x, y, z, classification, geometry and predicted_classification.
-        resolution (float): The resolution (pixel size) to be used for rasterization.
-        desired_crs (str): The desired CRS (Coordinate Reference System) for the output GeoDataFrames.
-        output_raster (str): The path to save the rasterized building points as a GeoTIFF raster file.
-        output_shape_buildings (str): The path to save the buildings polygons as an ESRI Shapefile.
-        output_shape_buildings_points (str): The path to save the buildings centroids as an ESRI Shapefile.
-
-    Returns:
-        buildings_filtered_gdf (GeoDataFrame): A GeoDataFrame containing the buildings polygons
-                                               with columns for polygons, centroids and area.
+    Alternative building extraction: DBSCAN on the (standardised) x, y of building points,
+    one convex hull per cluster. `eps` refers to STANDARDISED coordinates, so it depends
+    on the extent of the area of interest.
     """
-    building_points_gdf = lidar_classified_gdf[lidar_classified_gdf['predicted_classification'] == 6]
+    pts = lidar_classified_gdf[lidar_classified_gdf["predicted_classification"] == BUILDING_CLASS]
+    xy = pts[["x", "y"]].copy()
+    scaled = StandardScaler().fit_transform(xy.values)
+    xy["cluster"] = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(scaled)
+    xy = xy[xy["cluster"] != -1]
 
-    bounds = building_points_gdf.total_bounds
-    rows = int((bounds[3] - bounds[1]) / resolution)
-    cols = int((bounds[2] - bounds[0]) / resolution)
-    output_profile = {
-        'driver': 'GTiff',
-        'dtype': np.uint8,
-        'count': 1,
-        'width': cols,
-        'height': rows,
-        'transform': from_bounds(*bounds, cols, rows),
-        'crs': desired_crs,
-    }
-    raster = np.zeros((output_profile['height'], output_profile['width']), output_profile['dtype'])
-    rasterized = rasterize(
-        shapes=building_points_gdf.geometry,
-        out=raster,
-        transform=output_profile['transform'],
-        fill=0,
-        default_value=255,
-        dtype=output_profile['dtype'],
-    )
+    labels, hulls = [], []
+    for label, group in xy.groupby("cluster"):
+        labels.append(label)
+        hulls.append(MultiPoint(group[["x", "y"]].values).convex_hull)
+    gdf = gpd.GeoDataFrame({"cluster": labels}, geometry=hulls, crs=desired_crs)
 
-    with rasterio.open(output_raster, 'w', **output_profile) as dst:
-        dst.write(rasterized, 1)
-    print(f"Building Raster saved: {output_raster}")
+    _ensure_parent(out_shapefile_buildings_dbscan)
+    gdf.to_file(out_shapefile_buildings_dbscan, driver="ESRI Shapefile")
+    print(f"DBSCAN buildings saved: {out_shapefile_buildings_dbscan}")
+    return gdf
 
 
-    polygons = []
-    for polygon, value in shapes(raster, mask=raster == 255, transform=output_profile['transform']):
-        if value == 255:
-            polygons.append(shape(polygon))
-
-    buildings_gdf = gpd.GeoDataFrame({'geometry': polygons}, crs=desired_crs)
-    buildings_gdf = buildings_gdf.rename_geometry('polygons')
-    buildings_gdf['centroids'] = buildings_gdf.centroid
-    buildings_gdf['area'] = buildings_gdf.area
-
-    buildings_filtered_gdf = buildings_gdf[buildings_gdf.area > 10]
-    buildings_filtered_gdf['polygons'].to_file(output_shape_buildings, driver='ESRI Shapefile')
-    buildings_filtered_gdf['centroids'].to_file(output_shape_buildings_points, driver='ESRI Shapefile')
-    print(f"Building Shapefiles saved: {output_shape_buildings}, {output_shape_buildings_points}")
-    return buildings_filtered_gdf
-
-def buildings_to_polygon_dbscan(lidar_classified_gdf, desired_crs, out_shapefile_buildings_dbscan):
+# ----------------------------------------------------------------- Sentinel -> lava flow
+def lava_cluster_plotter(in_image, out_raster_lava_classification, n_clusters=10,
+                         random_state=42, show=True):
     """
-    Converts classified building points from a lidar GeoDataFrame into polygons using DBSCAN algorithm and saves them as an ESRI Shapefile.
-
-    Parameters:
-        lidar_classified_gdf (GeoDataFrame): A GeoDataFrame containing classified lidar data with columns
-                                             for x, y, z, classification, geometry and predicted_classification.
-        desired_crs (str): The desired CRS (Coordinate Reference System) for the output GeoDataFrame.
-        out_shapefile_buildings_dbscan (str): The path to save the buildings polygons generated by DBSCAN as an ESRI Shapefile.
-
-    Returns:
-        buildings_polygon_gdf (GeoDataFrame): A GeoDataFrame containing the polygons of the buildings generated by DBSCAN
-                                              with the cluster labels.
+    K-Means on band 1 of a satellite image. Saves the cluster image as GeoTIFF and returns
+    a GeoDataFrame with one point per pixel (pixel centre) and a 'cluster_kmeans' column.
     """
-    gdf_dbscan = lidar_classified_gdf[lidar_classified_gdf['predicted_classification'] == 6]
-    gdf_dbscan = gdf_dbscan[['x', 'y', 'geometry']]
-    coords = gdf_dbscan[['x', 'y']].values
-    scaler = StandardScaler()
-    coords_scaled = scaler.fit_transform(coords)
+    with rasterio.open(in_image) as image:
+        band = image.read(1)
+        transform, crs, meta = image.transform, image.crs, image.meta.copy()
 
-    eps = 0.1
-    min_samples = 5
-    dbscan = DBSCAN(eps=eps, min_samples=min_samples)
-    clusters = dbscan.fit_predict(coords_scaled)
+    km = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+    labels = km.fit_predict(band.reshape(-1, 1))
+    clusters = labels.reshape(band.shape)
 
-    gdf_dbscan['cluster'] = clusters
+    rows, cols = np.indices(band.shape)
+    xs, ys = transform_xy(transform, rows.ravel(), cols.ravel())  # pixel centres
+    gdf = gpd.GeoDataFrame({"cluster_kmeans": labels},
+                           geometry=gpd.points_from_xy(np.asarray(xs), np.asarray(ys)), crs=crs)
 
-    polygons = []
+    # No 'nodata' is set: cluster 0 is a valid class and must not be masked.
+    meta.update({"count": 1, "dtype": "uint8", "compress": "lzw", "nodata": None})
+    _ensure_parent(out_raster_lava_classification)
+    with rasterio.open(out_raster_lava_classification, "w", **meta) as dst:
+        dst.write(clusters.astype("uint8"), 1)
+    print(f"Lava cluster GeoTIFF saved: {out_raster_lava_classification}")
 
-    gdf_clusters = gdf_dbscan[gdf_dbscan['cluster'] != -1]
-
-    for cluster_label in gdf_clusters['cluster'].unique():
-        cluster_coords = gdf_clusters.loc[gdf_clusters['cluster'] == cluster_label, ['x', 'y']].values
-        outline_polygon = Polygon(cluster_coords).convex_hull
-        polygons.append(outline_polygon)
-
-    buildings_polygon_gdf = gpd.GeoDataFrame(geometry=polygons, index=gdf_clusters['cluster'].unique(), crs=desired_crs)
-
-    buildings_polygon_gdf.to_file(out_shapefile_buildings_dbscan, driver='ESRI Shapefile')
-    print(f"Building Shapefiles saved: {out_shapefile_buildings_dbscan}")
-    return buildings_polygon_gdf
-
-def lava_cluster_plotter(in_image, out_raster_lava_classification):
-    """
-    Perform K-means clustering on a satellite image and save the cluster image as a GeoTIFF file.
-
-    Parameters:
-        in_image (str): Path to the input raster image.
-        out_raster_lava_classification (str): Path to save the output cluster image as a GeoTIFF file.
-
-    Returns:
-        lava_classified_gdf (GeoDataFrame): GeoDataFrame containing the K-Means cluster assignments.
-    """
-    
-    image = rasterio.open(in_image)
-    band_index = 1  
-    band = image.read(band_index)
-
-    X = band.reshape((-1,1))
-
-    k_means = KMeans(n_clusters=10)
-    k_means.fit(X)
-
-    clusters = k_means.labels_
-    clusters = clusters.reshape(band.shape)
-    
-    coords = []
-    for i in range(image.height):
-        for j in range(image.width):
-            lon, lat = image.xy(i, j)
-            coords.append(Point(lon, lat))
-        
-    lava_classified_df = pd.DataFrame({'geometry': coords, 'cluster_kmeans': clusters.flatten()})
-
-    lava_classified_gdf = gpd.GeoDataFrame(lava_classified_df, crs=image.crs)
-
-    metadata = image.meta
-    metadata.update({
-        'count': 1,  
-        'dtype': rasterio.uint8, 
-        'compress': 'lzw',  
-         'nodata': 0,  
-    })
-
-    with rasterio.open(out_raster_lava_classification, 'w', **metadata) as dst:
-        dst.write(clusters.astype(rasterio.uint8), 1)
-    print(f'Lava Clusters GeoTIFF file saved: {out_raster_lava_classification}')
-
-    plt.figure(figsize=(20,20))
+    plt.figure(figsize=(12, 12))
     plt.imshow(clusters, cmap="Set1")
-    plt.colorbar(label='Classification')
-    plt.show()
-    
-    return lava_classified_gdf
-        
-def lava_extractor(lava_classified_gdf, out_shapefile_lavaflow):
+    plt.colorbar(label="K-Means cluster")
+    _finish_plot(show)
+    return gdf
+
+
+def lava_extractor(lava_classified_gdf, out_shapefile_lavaflow, cluster_number=None,
+                   dbscan_cluster=0, eps=100, min_samples=100, alpha=0.1, show=True):
     """
-    Extract a lava flow polygon from a cluster in a GeoDataFrame using DBSCAN clustering.
+    Extract the lava flow polygon from one K-Means cluster.
 
-    Parameters:
-        lava_classified_gdf (GeoDataFrame): GeoDataFrame containing cluster assignments and coordinates.
-        out_shapefile_lavaflow (str): Path to save the output shapefile containing the lava flow polygon.
-
-    Returns:
-        lava_polygon_gdf (GeoDataFrame): GeoDataFrame containing the extracted lava flow polygon.
+    cluster_number : K-Means cluster that represents lava (asked interactively if None).
+    dbscan_cluster : DBSCAN cluster to keep. 0 reproduces the original behaviour;
+                     use "largest" to keep the biggest cluster instead.
+    eps, min_samples : DBSCAN parameters (eps in CRS units, i.e. metres for UTM).
+    alpha : alpha-shape parameter used to build the (concave) outline.
     """
-    cluster_number = int(input('Enter the K-Means cluster number representing the lava flow:'))
-    lava_gdf = lava_classified_gdf[lava_classified_gdf['cluster_kmeans'] == cluster_number]
-    lava_gdf['x'] = lava_gdf['geometry'].x
-    lava_gdf['y'] = lava_gdf['geometry'].y
-    
-    dbscan = DBSCAN(eps=100, min_samples=100)
-    labels = dbscan.fit_predict(lava_gdf[['x', 'y']])
-    lava_gdf['cluster_dbscan'] = labels
-    
-    fig, ax = plt.subplots(figsize=(10, 10))
-    lava_gdf.plot(column='cluster_dbscan', cmap='Set1', ax=ax, legend=True)
-    plt.xlabel('X')
-    plt.ylabel('Y')
-    plt.title('DBSCAN Clustering')
-    plt.show()
-    
-    final_lava_gdf = lava_gdf[lava_gdf['cluster_dbscan'] == 0]
-    
-    fig, ax = plt.subplots(figsize=(10, 10))
-    final_lava_gdf.plot(column='cluster_dbscan', cmap='Set1', ax=ax, legend=True)
-    plt.xlabel('X')
-    plt.ylabel('Y')
-    plt.title('Extracted Lava Flow')
-    plt.show()
-    
-    points = final_lava_gdf.geometry.apply(lambda geom: (geom.x, geom.y)).tolist()
-    
-    alpha = 0.1  
-    concave_hull = alphashape(points, alpha)
-    lava_polygon_gdf = gpd.GeoDataFrame(geometry=[concave_hull], crs=lava_classified_gdf.crs)
-    lava_polygon_gdf.to_file(out_shapefile_lavaflow, driver='ESRI Shapefile')
-    print(f'Lava Flow Shapefile saved: {out_shapefile_lavaflow}')
-    
-    return lava_polygon_gdf
+    from alphashape import alphashape  # imported here: slow to import and only needed here
 
-def affected_buildings(buildings_filtered_gdf, lava_polygon_gdf, out_shapefile_affected_buildings, out_shapefile_affected_buildings_points):
+    if cluster_number is None:
+        cluster_number = int(input("Enter the K-Means cluster number representing the lava flow: "))
+    lava = lava_classified_gdf[lava_classified_gdf["cluster_kmeans"] == cluster_number].copy()
+    if lava.empty:
+        raise ValueError(f"K-Means cluster {cluster_number} has no pixels.")
+    lava["x"], lava["y"] = lava.geometry.x, lava.geometry.y
+    lava["cluster_dbscan"] = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(lava[["x", "y"]])
+
+    valid = lava[lava["cluster_dbscan"] != -1]
+    if valid.empty:
+        raise ValueError("DBSCAN found no cluster; try a smaller eps or min_samples.")
+    keep = valid["cluster_dbscan"].value_counts().idxmax() if dbscan_cluster == "largest" else int(dbscan_cluster)
+    final = lava[lava["cluster_dbscan"] == keep]
+    if final.empty:
+        raise ValueError(f"DBSCAN cluster {keep} does not exist; try dbscan_cluster='largest'.")
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    final.plot(ax=ax, markersize=1)
+    ax.set_title("Extracted lava flow")
+    _finish_plot(show)
+
+    hull = alphashape(list(zip(final["x"], final["y"])), alpha)
+    out = gpd.GeoDataFrame(geometry=[hull], crs=lava_classified_gdf.crs)
+    _ensure_parent(out_shapefile_lavaflow)
+    out.to_file(out_shapefile_lavaflow, driver="ESRI Shapefile")
+    print(f"Lava flow saved: {out_shapefile_lavaflow}")
+    if out.crs is not None and out.crs.is_projected:
+        print(f"Lava flow area: {out.area.sum() / 1e6:.2f} km2")
+    return out
+
+
+# --------------------------------------------------------------- affected buildings / DTM
+def affected_buildings(buildings_filtered_gdf, lava_polygon_gdf, out_shapefile_affected_buildings,
+                       out_shapefile_affected_buildings_points):
     """
-    Identify the buildings affected by a lava flow and save them as an ESRI Shapefile.
-
-    Parameters:
-        buildings_filtered_gdf (GeoDataFrame): GeoDataFrame containing the buildings to be analyzed.
-        lava_polygon_gdf (GeoDataFrame): GeoDataFrame representing the lava flow polygon.
-        out_shapefile_affected_buildings (str): Path to save the output ESRI Shapefile containing the affected building polygons.
-        out_shapefile_affected_buildings_points (str): Path to save the output ESRI Shapefile containing the centroids of the affected buildings.
-
-    Returns:
-        buildings_w_lava_gdf (GeoDataFrame): GeoDataFrame containing the affected buildings.
+    Buildings whose footprint intersects the lava flow polygon(s).
+    `lava_polygon_gdf` must contain polygons (not the per-pixel point GeoDataFrame).
     """
+    if not lava_polygon_gdf.geom_type.isin(["Polygon", "MultiPolygon"]).all():
+        raise TypeError("lava_polygon_gdf must contain Polygon/MultiPolygon geometries.")
+    lava = lava_polygon_gdf[[lava_polygon_gdf.geometry.name]]
+    if lava.crs != buildings_filtered_gdf.crs:
+        lava = lava.to_crs(buildings_filtered_gdf.crs)
 
-    buildings_w_lava_gdf = gpd.sjoin(buildings_filtered_gdf, lava_polygon_gdf, predicate="intersects")
-    print(f"Total affected buildings: {len(buildings_w_lava_gdf)}")
-    buildings_w_lava_gdf['polygons'].to_file(out_shapefile_affected_buildings, driver='ESRI Shapefile')
-    buildings_w_lava_gdf['centroids'].to_file(out_shapefile_affected_buildings_points, driver='ESRI Shapefile')
-    print(f'Affected Buildings Shapefiles saved: {out_shapefile_affected_buildings} , {out_shapefile_affected_buildings_points}')
-    return buildings_w_lava_gdf 
+    hit = gpd.sjoin(buildings_filtered_gdf, lava, how="inner", predicate="intersects")
+    hit = hit[~hit.index.duplicated()].drop(columns="index_right")
+    print(f"Total affected buildings: {len(hit)}")
 
-def elevation_change(in_raster_before, in_raster_after, out_raster_difference):
+    _ensure_parent(out_shapefile_affected_buildings)
+    hit["polygons"].to_file(out_shapefile_affected_buildings, driver="ESRI Shapefile")
+    hit["centroids"].to_file(out_shapefile_affected_buildings_points, driver="ESRI Shapefile")
+    print(f"Affected buildings saved: {out_shapefile_affected_buildings}")
+    return hit
+
+
+def elevation_change(in_raster_before, in_raster_after, out_raster_difference,
+                     resampling=Resampling.bilinear, after_minus_before=False):
     """
-    Calculate the elevation change between two input raster files and save the difference as a GeoTIFF.
+    Elevation difference between two rasters on the grid of the 'before' raster.
 
-    Parameters:
-        in_raster_before (Path): Path to the input raster file representing elevation data before the event.
-        in_raster_after (Path): Path to the input raster file representing elevation data after the event.
-        out_raster_difference (Path): Path to save the output GeoTIFF file containing the elevation change.
-
+    The 'after' raster is resampled onto the 'before' grid. By default the output is
+    before - after (as in the original analysis, so lava thickness is NEGATIVE);
+    set after_minus_before=True for the usual after - before convention.
     """
-    src1 = rasterio.open(in_raster_before)
-    src2 = rasterio.open(in_raster_after)
-    data2, _ = rasterio.warp.reproject(
-        source=rasterio.band(src2, 1),
-        destination=np.empty_like(src1.read(1)),
-        src_transform=src2.transform,
-        src_crs=src2.crs,
-        dst_transform=src1.transform,
-        dst_crs=src1.crs,
-        resampling=Resampling.bilinear)
+    with rasterio.open(in_raster_before) as src1, rasterio.open(in_raster_after) as src2:
+        nodata = src1.nodata if src1.nodata is not None else -9999.0
+        before = src1.read(1).astype("float32")
+        after = np.full(before.shape, nodata, dtype="float32")
+        rasterio.warp.reproject(
+            source=rasterio.band(src2, 1), destination=after,
+            src_transform=src2.transform, src_crs=src2.crs, src_nodata=src2.nodata,
+            dst_transform=src1.transform, dst_crs=src1.crs, dst_nodata=nodata,
+            resampling=resampling)
+        valid = (before != nodata) & (after != nodata) & np.isfinite(before) & np.isfinite(after)
+        diff = (after - before) if after_minus_before else (before - after)
+        diff = np.where(valid, diff, nodata).astype("float32")
 
-    data1 = src1.read(1)
-    diff = data1 - data2
-    diff[np.isinf(diff) | np.isnan(diff)] = src1.nodata
-    output_profile = src1.profile
-    output_profile.update(count=1) 
-    with rasterio.open(out_raster_difference, 'w', **output_profile) as dst:
-        dst.write(diff, 1)
-    print(f'Elevation Change GeoTIFF saved: {out_raster_difference}')
+        profile = src1.profile
+        profile.update(count=1, dtype="float32", nodata=nodata)
+        _ensure_parent(out_raster_difference)
+        with rasterio.open(out_raster_difference, "w", **profile) as dst:
+            dst.write(diff, 1)
+    print(f"Elevation change GeoTIFF saved: {out_raster_difference}")
 
-    src1.close()
-    src2.close()
 
-def import_geoDataFrame_to_database(input_gdf, table_name):
+# ------------------------------------------------------------------------------ database
+def _db_settings():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+    return {
+        "host": os.getenv("DB_HOST", "localhost"),
+        "port": os.getenv("DB_PORT", "5432"),
+        "database": os.getenv("DB_NAME", "la_palma"),
+        "username": os.getenv("DB_USER", "postgres"),
+        "password": os.getenv("DB_PASSWORD") or getpass.getpass("Enter the database password: "),
+    }
+
+
+def get_db_engine(settings=None):
+    from sqlalchemy import create_engine
+    from sqlalchemy.engine import URL
+    s = settings or _db_settings()
+    return create_engine(URL.create("postgresql+psycopg2", username=s["username"], password=s["password"],
+                                    host=s["host"], port=int(s["port"]), database=s["database"]))
+
+
+def import_geoDataFrame_to_database(input_gdf, table_name, if_exists="replace", engine=None):
     """
-    Imports a GeoDataFrame into a PostGIS database table.
-
-    Parameters:
-        input_gdf (GeoDataFrame): The GeoDataFrame containing the spatial data to be imported.
-        table_name (str): The name of the PostGIS database table to import the data into.
-
-    Returns:
-        None
+    Write a GeoDataFrame to PostGIS. Only the active geometry column is written (extra
+    geometry columns such as 'centroids' are dropped). if_exists: 'replace', 'append' or 'fail'.
     """
-    password = getpass.getpass('Enter the database password:')
-    engine = create_engine('postgresql://postgres:' + password + '@localhost:5432/la_palma')
-    input_gdf.to_postgis(table_name, con=engine)
-    print(f'GeoDataFrame {input_gdf} saved to the PostGIS database table {table_name}.')
+    gdf = input_gdf.drop(columns=["index_right"], errors="ignore")
+    extra = [c for c in gdf.columns if c != gdf.geometry.name and str(gdf[c].dtype) == "geometry"]
+    gdf = gdf.drop(columns=extra)
+    gdf.to_postgis(table_name, con=engine or get_db_engine(), if_exists=if_exists)
+    print(f"{len(gdf)} rows saved to PostGIS table '{table_name}'.")
 
-def import_raster_to_database(input_raster, table_name):
+
+def import_raster_to_database(input_raster, table_name, srid=32628, tile_size="256x256"):
     """
-    Imports a raster dataset into a PostGIS database table.
-
-    Parameters:
-        input_raster (str): The file path to the raster dataset to be imported.
-        table_name (str): The name of the PostGIS database table to import the raster into.
-
-    Returns:
-        None
-
+    Load a raster into PostGIS with raster2pgsql | psql. Both programs must be on PATH
+    (or set RASTER2PGSQL / PSQL to their full paths).
     """
-    host = 'localhost'
-    port = '5432'
-    database = 'la_palma'
-    username = 'postgres'
-    password = getpass.getpass('Enter the database password:')
-
-    command_raster2pgsql = [
-        r"C:\Program Files\PostgreSQL\15\bin\raster2pgsql.exe", '-I', '-C', '-M', input_raster
-    ]
-    command_psql = [
-        r"C:\Program Files\PostgreSQL\15\bin\psql.exe", '-h', host, '-p', port, '-d', database, '-U', username,
-        '--password', password
-    ]
-
-    process_raster2pgsql = subprocess.Popen(command_raster2pgsql, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    output_raster2pgsql, error_raster2pgsql = process_raster2pgsql.communicate()
-
-    if process_raster2pgsql.returncode == 0:
-        process_psql = subprocess.Popen(command_psql, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        output_psql, error_psql = process_psql.communicate(input=output_raster2pgsql)
-        
-        if process_psql.returncode == 0:
-            print(f'Raster file {input_raster} saved to the PostGIS database table {table_name}')
-        else:
-            print('An error occurred in psql command:', error_psql.decode())
+    raster2pgsql = os.getenv("RASTER2PGSQL") or shutil.which("raster2pgsql")
+    psql = os.getenv("PSQL") or shutil.which("psql")
+    if not raster2pgsql or not psql:
+        raise FileNotFoundError("raster2pgsql / psql not found. Add PostgreSQL's bin folder to PATH "
+                                "or set RASTER2PGSQL and PSQL.")
+    s = _db_settings()
+    sql = subprocess.run([raster2pgsql, "-s", str(srid), "-I", "-C", "-M", "-t", tile_size,
+                          str(input_raster), table_name], capture_output=True)
+    if sql.returncode != 0:
+        print("raster2pgsql failed:", sql.stderr.decode(errors="replace"))
+        return
+    load = subprocess.run([psql, "-h", s["host"], "-p", str(s["port"]), "-d", s["database"],
+                           "-U", s["username"], "-q"],
+                          input=sql.stdout, capture_output=True,
+                          env={**os.environ, "PGPASSWORD": s["password"]})
+    if load.returncode == 0:
+        print(f"Raster {input_raster} saved to PostGIS table '{table_name}'.")
     else:
-        print('An error occurred in raster2pgsql command:', error_raster2pgsql.decode())  
+        print("psql failed:", load.stderr.decode(errors="replace"))
 
-def main():
-    """
-    Executes the main workflow for processing lidar and image data.
 
-    Parameters:
-        None
+# ------------------------------------------------------------------------------- main
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data-dir", default=os.getenv("LA_PALMA_DATA_DIR", "data"))
+    ap.add_argument("--output-dir", default=os.getenv("LA_PALMA_OUTPUT_DIR", "output"))
+    ap.add_argument("--lava-cluster", type=int, default=None,
+                    help="K-Means cluster number of the lava flow (asked interactively if omitted)")
+    ap.add_argument("--lava-dbscan-cluster", default="0",
+                    help="DBSCAN cluster to keep: an integer (default 0) or 'largest'")
+    ap.add_argument("--no-plots", action="store_true", help="do not open matplotlib windows")
+    ap.add_argument("--to-db", action="store_true", help="also load results into PostGIS")
+    ap.add_argument("--raster-to-db", action="store_true", help="also load the elevation-change raster")
+    args = ap.parse_args(argv)
 
-    Returns:
-        None
-    """
-    lidar_gdf = import_las_to_geoDataFrame(IN_AOI_LAS, DESIRED_CRS)
-    lidar_classified_gdf = random_forest_classifier_from_pickle(lidar_gdf, OUT_RF_MODEL)
-    buildings_filtered_gdf = buildings_to_polygon(lidar_classified_gdf, RESOLUTION, DESIRED_CRS, OUT_RASTER_BUILDINGS, OUT_SHAPEFILE_BUILDINGS_POLYGON, OUT_SHAPEFILE_BUILDINGS_POINT)
-    lava_classified_gdf = lava_cluster_plotter(IN_IMAGE, OUT_RASTER_LAVA_CLASSIFICATION) 
-    lava_polygon_gdf = lava_extractor(lava_classified_gdf, OUT_SHAPEFILE_LAVAFLOW)
-    buildings_w_lava_gdf = affected_buildings(buildings_filtered_gdf, lava_classified_gdf, OUT_SHAPEFILE_AFFECTED_BUILDINGS, OUT_SHAPEFILE_AFFECTED_BUILDINGS_POINTS)
-    elevation_change(IN_RASTER_BEFORE, IN_RASTER_AFTER, OUT_RASTER_DIFFERENCE)
-    # import_geoDataFrame_to_database(buildings_filtered_gdf, 'buildings')
-    # import_geoDataFrame_to_database(lava_polygon_gdf, 'lava_flow')
-    # import_geoDataFrame_to_database(buildings_w_lava_gdf, 'affected_buildings')
-    # import_raster_to_database(OUT_RASTER_DIFFERENCE, 'elevation_raster')
+    p = build_paths(args.data_dir, args.output_dir)
+    show = not args.no_plots
+    dbscan_cluster = args.lava_dbscan_cluster if args.lava_dbscan_cluster == "largest" else int(args.lava_dbscan_cluster)
 
-if __name__ == '__main__':
+    lidar = import_las_to_geoDataFrame(p["aoi_las"], DESIRED_CRS)
+    classified = random_forest_classifier(lidar, p["rf_model"])
+    buildings = buildings_to_polygon(classified, RESOLUTION, DESIRED_CRS, p["buildings_raster"],
+                                     p["buildings_polygon"], p["buildings_point"])
+    lava_pixels = lava_cluster_plotter(p["image"], p["lava_raster"], show=show)
+    lava_polygon = lava_extractor(lava_pixels, p["lava_flow"], cluster_number=args.lava_cluster,
+                                  dbscan_cluster=dbscan_cluster, show=show)
+    affected = affected_buildings(buildings, lava_polygon, p["affected_polygon"], p["affected_point"])
+    elevation_change(p["dtm_before"], p["dtm_after"], p["difference"])
+
+    if args.to_db:
+        engine = get_db_engine()
+        import_geoDataFrame_to_database(buildings, "buildings", engine=engine)
+        import_geoDataFrame_to_database(lava_polygon, "lava_flow", engine=engine)
+        import_geoDataFrame_to_database(affected, "affected_buildings", engine=engine)
+    if args.raster_to_db:
+        import_raster_to_database(p["difference"], "elevation_raster")
+
+
+if __name__ == "__main__":
     main()
