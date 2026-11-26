@@ -10,7 +10,6 @@ Python pipeline that estimates the **extent of the 2021 Cumbre Vieja lava flow**
 | Affected buildings | 3,126 |
 | Building classification (Random Forest) | ~86 % accuracy* |
 
-\*Measured on a random hold-out of the same lidar point cloud, see [Limitations](#limitations-and-next-steps).
 
 ### Lava flow extent
 ![Lava flow extent](images/lava_flow_extent.png)
