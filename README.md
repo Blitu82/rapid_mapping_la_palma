@@ -12,11 +12,17 @@ Python pipeline that estimates the **extent of the 2021 Cumbre Vieja lava flow**
 
 \*Measured on a random hold-out of the same lidar point cloud, see [Limitations](#limitations-and-next-steps).
 
-<!--
-  TO DO: paste here the image lines that are in your current README
-  (lava flow map, affected buildings, elevation change), e.g.
-  ![Lava flow extent](images/your_image.png)
--->
+### Lava flow extent
+![Lava flow extent](images/lava_flow_extent.png)
+Lava flow polygon extracted from a Sentinel image with K-Means and DBSCAN, covering **12.4 km²**.
+
+### Affected buildings
+![Affected buildings](images/affected_buildings.png)
+Buildings detected from lidar with a Random Forest classifier (~86% accuracy on the test set) that intersect the lava flow: **3126 buildings**.
+
+### Morphology change
+![Elevation change](images/DTM_diff.png)
+Elevation difference between the pre-eruption terrain model and the post-eruption surface model (January 2022).
 
 ## Method
 
@@ -38,68 +44,6 @@ Python pipeline that estimates the **extent of the 2021 Cumbre Vieja lava flow**
 ├── .env.example             # database settings template
 └── ...                      # notebook, presentation and images
 ```
-
-## Getting started
-
-### 1. Install
-
-```bash
-conda env create -f environment.yml
-conda activate la-palma
-# or: python -m venv .venv && pip install -r requirements.txt
-```
-
-### 2. Get the data
-
-Create a `data/` folder with this layout (files are not stored in the repository):
-
-```
-data/
-├── las/lidar_AOI.las
-├── sentinel/sentinel_lava.tif
-└── dtm/
-    ├── before/Before_MDT02_REGCAN95_UTM28N_2m.tiff
-    └── after/Cumbre_Vieja_DSM_SfM_January_2022_20cm_REGCAN95.tif
-```
-
-Sources: Spanish national lidar (PNOA-LiDAR, CNIG), Copernicus Sentinel imagery, and the pre/post-eruption elevation models as described in the original project. All data use ETRS89/REGCAN95 and are processed in WGS 84 / UTM 28N (EPSG:32628).
-
-### 3. Run
-
-```bash
-python la_palma.py --data-dir data --output-dir output
-```
-
-The script shows the K-Means clusters and asks which cluster is the lava flow. To skip the prompt and plots:
-
-```bash
-python la_palma.py --lava-cluster 3 --no-plots
-```
-
-Outputs go to `output/` (shapefiles, GeoTIFFs, trained model).
-
-### 4. (Optional) PostGIS
-
-```bash
-cp .env.example .env          # then edit DB_PASSWORD
-docker compose up -d          # starts PostGIS on localhost:5432
-python la_palma.py --to-db    # writes buildings, lava_flow, affected_buildings
-```
-
-Tables are replaced on each run. The password is read from `.env` / environment, or asked interactively. Never commit `.env`.
-
-### Tests
-
-```bash
-pytest
-```
-
-## Limitations and next steps
-
-- **Random Forest evaluation.** The model uses only x, y, z and is scored on a random 20 % split of the same point cloud, so the ~86 % accuracy is likely optimistic for new areas. A spatial hold-out, extra features (return number, intensity, local height) and per-class precision/recall would be a fairer test.
-- **Lava extraction.** K-Means on a single band is sensitive to clouds, ash and shadows, and the lava cluster is chosen by eye. Comparing the 12.4 km² with the Copernicus EMS delineation would validate it.
-- **Elevation change.** The default sign is *before − after*, so new lava appears negative. Use `elevation_change(..., after_minus_before=True)` for the usual convention.
-- **Coordinates and DBSCAN.** The DBSCAN building extraction uses standardised coordinates, so `eps` depends on the study area extent.
 
 ## Author
 
