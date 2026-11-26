@@ -1,6 +1,6 @@
 # Rapid Mapping: La Palma volcanic eruption
 
-Python pipeline that estimates the **extent of the 2021 Cumbre Vieja lava flow**, the **buildings affected** and the **terrain change**, using airborne lidar, a Sentinel satellite image and pre/post-eruption elevation models. Results are stored as shapefiles/GeoTIFFs and, optionally, in a **PostGIS** database.
+A Python workflow that reproduces, at a small scale, the kind of products delivered by the [Copernicus Emergency Management Service (CEMS) Rapid Mapping](https://emergency.copernicus.eu/mapping/) service: a delineation of the **extent of the 2021 Cumbre Vieja lava flow**, an assessment of the **buildings affected**, and the **terrain change** caused by the eruption. It combines airborne lidar, a Sentinel satellite image and pre/post-eruption elevation models. Results are saved as shapefiles and GeoTIFFs and, optionally, in a **PostGIS** database.
 
 ## Key results
 
