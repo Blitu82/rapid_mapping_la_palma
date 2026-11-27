@@ -44,9 +44,9 @@ Elevation difference between the pre-eruption terrain model and the post-eruptio
 └── ...                      # notebook, presentation and images
 ```
 
-## Author
+## Contact
 
-Blitu82 · [GitHub profile](https://github.com/Blitu82)
+Pablo García García · https://www.linkedin.com/in/garpablo/<
 
 ## License
 
